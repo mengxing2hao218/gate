@@ -41,12 +41,23 @@ VPNGATE_MIRROR = os.environ.get(
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
 WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://你的域名/check?sstp=vpn:vpn@")
+CHECK_TOKEN = os.environ.get("CHECK_TOKEN", "").strip()
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
+
+
+def worker_headers(token):
+    token = str(token or "").strip()
+    if not token:
+        raise RuntimeError("CHECK_TOKEN is required")
+    return {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "gate-checker/1.0",
+    }
 
 DATA_CENTER_ORG_KEYWORDS = [
     "GOOGLE", "AMAZON", "AWS", "MICROSOFT", "OVH", "HETZNER", "DIGITALOCEAN",
@@ -236,7 +247,7 @@ def check_one(node, session):
     out["exit"] = None
     out["residential"] = "unknown"
     try:
-        r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
+        r = session.get(url, timeout=CHECK_TIMEOUT)
         if r.status_code != 200:
             out["error"] = f"HTTP {r.status_code}"
             out["worker_error"] = True
@@ -305,6 +316,13 @@ EDGE_HOSTS = [
 
 NODES_URL = os.environ.get("NODES_URL", "https://YOUR_GITHUB_USERNAME.github.io/gate/nodes.txt")
 
+
+def country_flag(code):
+    code = str(code or "").strip().upper()
+    if len(code) != 2 or not code.isalpha():
+        return "🌐"
+    return "".join(chr(127397 + ord(char)) for char in code)
+
 def build_nodes_text(data):
     """生成纯节点行版本 (无注释): 每行 = 入口地址#名字$sstp://..."""
     countries = data["countries"]
@@ -316,17 +334,18 @@ def build_nodes_text(data):
     for cname, grp in ordered:
         code = str(grp.get("code") or "?").upper()
         zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
+        label = f"{country_flag(code)} {zh}"
         nodes = sorted(grp["nodes"], key=lambda n: (0 if n.get("residential") == "residential" else 1, n.get("latency_ms") is None, n.get("latency_ms") or 0, n.get("host") or ""))
         res_nodes = [n for n in nodes if n.get("residential") == "residential"]
         dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
         for i, n in enumerate(res_nodes, 1):
             entry = edge[idx % len(edge)]
             idx += 1
-            lines.append(f"{entry}#{zh}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+            lines.append(f"{entry}#{label}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
         for i, n in enumerate(dc_nodes, 1):
             entry = edge[idx % len(edge)]
             idx += 1
-            lines.append(f"{entry}#{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+            lines.append(f"{entry}#{label}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
     return "\n".join(lines) + "\n"
 
 def write_outputs(data):
@@ -357,6 +376,7 @@ def write_outputs(data):
 # ---------------------------------------------------------------------------
 def main():
     session = requests.Session()
+    session.headers.update(worker_headers(CHECK_TOKEN))
     rows, source = fetch_vpngate()
     raw_count = len(rows)
     if raw_count == 0:
@@ -383,6 +403,9 @@ def main():
     success = [r for r in results if r.get("success")]
     failed = [r for r in results if not r.get("success")]
     worker_errors = [r for r in failed if r.get("worker_error")]
+
+    if not success:
+        die("没有可用 SSTP 节点，本次运行不发布空结果，保留上一次成功部署")
 
     log("CLOUDFLARE WORKER", f"检测成功: {len(success)}")
     log("CLOUDFLARE WORKER", f"检测失败: {len(failed)}" + (f" (其中 Worker 异常 {len(worker_errors)})" if worker_errors else ""))
