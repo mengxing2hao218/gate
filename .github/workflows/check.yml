@@ -41,6 +41,10 @@ jobs:
           HOSTS_ENTRY: "edt.111065.xyz:443"
           NODES_URL: "https://mengxing2hao218.github.io/gate/nodes.txt"
 
+      - name: Consumer acceptance gate
+        run: |
+          python -c "from pathlib import Path; import vpngate; report = vpngate.validate_nodes_text(Path('public/nodes.txt').read_text(encoding='utf-8')); print(f\"accepted nodes={report['nodes']} unknown={report['unknown_ratio']:.1%}\")"
+
       - name: Ensure GitHub Pages is enabled (one-time auto setup)
         run: |
           code=$(curl -s -o /dev/null -w '%{http_code}' \
