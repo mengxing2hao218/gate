@@ -52,6 +52,8 @@ QUALITY_CONCURRENCY = max(1, min(16, int(os.environ.get("QUALITY_CONCURRENCY", "
 QUALITY_TIMEOUT = float(os.environ.get("QUALITY_TIMEOUT", "12"))
 QUALITY_MAX_IPS = max(1, min(100, int(os.environ.get("QUALITY_MAX_IPS", "100"))))
 QUALITY_SPEED_BAND_MS = max(100, int(os.environ.get("QUALITY_SPEED_BAND_MS", "500")))
+MIN_PUBLISH_NODES = max(1, int(os.environ.get("MIN_PUBLISH_NODES", "5")))
+MAX_UNKNOWN_RATIO = min(1.0, max(0.0, float(os.environ.get("MAX_UNKNOWN_RATIO", "0.25"))))
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
 
@@ -479,7 +481,86 @@ def build_nodes_text(data):
         lines.append(f"{entry}#{label}$sstp://vpn:vpn@{node['host']}:{node['port']}")
     return "\n".join(lines) + "\n"
 
+
+NODE_LINE_RE = re.compile(
+    r"^(?P<entry>[A-Za-z0-9.-]+):(?P<entry_port>\d{1,5})#"
+    r"(?P<label>[^$\r\n]{1,160})\$sstp://vpn:vpn@"
+    r"(?P<host>[A-Za-z0-9.-]+):(?P<port>\d{1,5})$"
+)
+NODE_LABEL_RE = re.compile(
+    r"^.+-(?P<exit_type>住宅|机房)-"
+    r"(?P<quality>🟢较净|🟡普通|🟠一般|🔴高风险|⚪未知)-"
+    r"(?P<latency>\d+)ms-(?P<sequence>\d{2,})$"
+)
+QUALITY_LABEL_RANK = {
+    "🟢较净": 0,
+    "🟡普通": 1,
+    "🟠一般": 2,
+    "🔴高风险": 3,
+    "⚪未知": 4,
+}
+
+
+def validate_nodes_text(text, min_nodes=MIN_PUBLISH_NODES, max_unknown_ratio=MAX_UNKNOWN_RATIO):
+    if not isinstance(text, str):
+        raise ValueError("使用者复检失败：节点内容不是文本")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) < max(1, int(min_nodes)):
+        raise ValueError(f"使用者复检失败：仅 {len(lines)} 个节点，低于上线门槛 {min_nodes}")
+
+    seen_sources = set()
+    sort_keys = []
+    unknown = 0
+    for number, line in enumerate(lines, 1):
+        if len(line.encode("utf-8")) > 2048 or any(ord(char) < 32 for char in line):
+            raise ValueError(f"使用者复检失败：第 {number} 行包含异常字符或长度超限")
+        match = NODE_LINE_RE.fullmatch(line)
+        if not match:
+            raise ValueError(f"使用者复检失败：第 {number} 行不是圈 X 可识别节点格式")
+        entry_port = int(match.group("entry_port"))
+        source_port = int(match.group("port"))
+        if not 1 <= entry_port <= 65535 or not 1 <= source_port <= 65535:
+            raise ValueError(f"使用者复检失败：第 {number} 行端口无效")
+
+        source = (match.group("host").lower(), source_port)
+        if source in seen_sources:
+            raise ValueError(f"使用者复检失败：第 {number} 行出现重复出口")
+        seen_sources.add(source)
+
+        label = NODE_LABEL_RE.fullmatch(match.group("label"))
+        if not label:
+            raise ValueError(f"使用者复检失败：第 {number} 行缺少国家、类型、质量或延迟标签")
+        latency = int(label.group("latency"))
+        if latency > 300_000:
+            raise ValueError(f"使用者复检失败：第 {number} 行延迟超出合理范围")
+        quality = label.group("quality")
+        unknown += quality == "⚪未知"
+        sort_keys.append(
+            (
+                latency // QUALITY_SPEED_BAND_MS,
+                QUALITY_LABEL_RANK[quality],
+                latency,
+                match.group("host").lower(),
+            )
+        )
+
+    if sort_keys != sorted(sort_keys):
+        raise ValueError("使用者复检失败：节点未按速度优先、质量其次排序")
+    unknown_ratio = unknown / len(lines)
+    if unknown_ratio > float(max_unknown_ratio):
+        raise ValueError(
+            f"使用者复检失败：未知质量占比 {unknown_ratio:.1%}，超过门槛 {float(max_unknown_ratio):.1%}"
+        )
+    return {"nodes": len(lines), "unknown": unknown, "unknown_ratio": unknown_ratio}
+
+
 def write_outputs(data):
+    nodes_text = build_nodes_text(data)
+    acceptance = validate_nodes_text(nodes_text)
+    log(
+        "USER ACCEPTANCE",
+        f"通过：{acceptance['nodes']} 个节点，未知质量 {acceptance['unknown_ratio']:.1%}",
+    )
     os.makedirs(PUBLIC_DIR, exist_ok=True)
     data_path = os.path.join(PUBLIC_DIR, "data.json")
     with open(data_path, "w", encoding="utf-8") as f:
@@ -498,7 +579,7 @@ def write_outputs(data):
 
     nodes_path = os.path.join(PUBLIC_DIR, "nodes.txt")
     with open(nodes_path, "w", encoding="utf-8") as f:
-        f.write(build_nodes_text(data))
+        f.write(nodes_text)
 
     return data_path, html_path, nodes_path
 
