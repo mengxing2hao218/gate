@@ -13,6 +13,7 @@ VPN Gate SSTP 节点检测流水线 (精简版)
 import base64
 import csv
 import io
+import ipaddress
 import json
 import os
 import re
@@ -46,6 +47,11 @@ CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))
+QUALITY_API_BASE = os.environ.get("QUALITY_API_BASE", "https://api.ipquery.io").rstrip("/")
+QUALITY_CONCURRENCY = max(1, min(16, int(os.environ.get("QUALITY_CONCURRENCY", "8"))))
+QUALITY_TIMEOUT = float(os.environ.get("QUALITY_TIMEOUT", "12"))
+QUALITY_MAX_IPS = max(1, min(100, int(os.environ.get("QUALITY_MAX_IPS", "100"))))
+QUALITY_SPEED_BAND_MS = max(100, int(os.environ.get("QUALITY_SPEED_BAND_MS", "500")))
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
 
@@ -237,6 +243,109 @@ def classify_network(host, exit_org, is_datacenter=None):
     if re.match(r"^vpn\d{5,}", h) or re.match(r"^vpnv\d+", h): return "residential"
     return "unknown"
 
+
+def unknown_quality(error=None):
+    return {
+        "label": "⚪未知",
+        "rank": 4,
+        "risk_score": None,
+        "is_proxy": None,
+        "is_vpn": None,
+        "is_tor": None,
+        "is_datacenter": None,
+        "source": "ipquery.io",
+        "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "error": error,
+    }
+
+
+def quality_grade(risk):
+    risk = risk if isinstance(risk, dict) else {}
+    flag_names = ("is_proxy", "is_vpn", "is_tor", "is_datacenter")
+    if (
+        any(not isinstance(risk.get(name), bool) for name in flag_names)
+        or isinstance(risk.get("risk_score"), bool)
+        or not isinstance(risk.get("risk_score"), (int, float))
+        or not 0 <= risk["risk_score"] <= 100
+    ):
+        return unknown_quality("quality API returned incomplete risk data")
+    try:
+        score = int(risk.get("risk_score"))
+    except (TypeError, ValueError):
+        score = None
+
+    flags = {
+        name: bool(risk.get(name))
+        for name in flag_names
+    }
+    if flags["is_proxy"] or flags["is_vpn"] or flags["is_tor"] or (score is not None and score >= 67):
+        label, rank = "🔴高风险", 3
+    elif flags["is_datacenter"] or (score is not None and score >= 34):
+        label, rank = "🟠一般", 2
+    elif score is not None and score <= 10:
+        label, rank = "🟢较净", 0
+    else:
+        label, rank = "🟡普通", 1
+
+    return {
+        "label": label,
+        "rank": rank,
+        "risk_score": score,
+        **flags,
+        "source": "ipquery.io",
+        "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "error": None,
+    }
+
+
+def fetch_quality(ip, session):
+    try:
+        address = ipaddress.ip_address(str(ip or "").strip())
+        if not address.is_global:
+            raise ValueError("exit IP is not globally routable")
+        response = session.get(f"{QUALITY_API_BASE}/{address}", timeout=QUALITY_TIMEOUT)
+        if response.status_code != 200:
+            raise RuntimeError(f"quality API HTTP {response.status_code}")
+        payload = response.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("risk"), dict):
+            raise ValueError("quality API returned no risk object")
+        return quality_grade(payload["risk"])
+    except Exception as exc:
+        return unknown_quality(f"{type(exc).__name__}: {str(exc)[:160]}")
+
+
+def enrich_quality(nodes, session):
+    by_ip = {}
+    for node in sorted(nodes, key=lambda n: (n.get("latency_ms") is None, n.get("latency_ms") or 0)):
+        exit_ip = str((node.get("exit") or {}).get("ip") or "").strip()
+        if exit_ip and exit_ip not in by_ip and len(by_ip) < QUALITY_MAX_IPS:
+            by_ip[exit_ip] = None
+
+    with ThreadPoolExecutor(max_workers=QUALITY_CONCURRENCY) as pool:
+        futures = {pool.submit(fetch_quality, ip, session): ip for ip in by_ip}
+        for future in as_completed(futures):
+            by_ip[futures[future]] = future.result()
+
+    for node in nodes:
+        exit_ip = str((node.get("exit") or {}).get("ip") or "").strip()
+        node["quality"] = by_ip.get(exit_ip) or unknown_quality("quality lookup unavailable")
+
+    return {
+        "checked_ips": len(by_ip),
+        "clean": sum(1 for value in by_ip.values() if value and value.get("rank") == 0),
+        "unknown": sum(1 for value in by_ip.values() if not value or value.get("rank") == 4),
+    }
+
+
+def node_sort_key(node):
+    latency = node.get("latency_ms")
+    try:
+        latency = max(0, int(latency))
+    except (TypeError, ValueError):
+        latency = 10**9
+    quality_rank = int((node.get("quality") or {}).get("rank", 4))
+    return (latency // QUALITY_SPEED_BAND_MS, quality_rank, latency, node.get("host") or "")
+
 def check_one(node, session):
     url = WORKER_CHECK_URL + quote(f"{node['host']}:{node['port']}", safe="")
     out = dict(node)
@@ -291,13 +400,13 @@ def build_outputs(results, raw_count, sstp_count, source):
         c = n["country"] or "未知"
         countries.setdefault(c, {"code": n["country_code"] or "?", "nodes": []})["nodes"].append(n)
 
-    stats = {"raw_nodes": raw_count, "sstp_nodes": sstp_count, "checked": len(results), "success": len(available), "failed": len(results) - len(available), "countries": len(countries), "residential_est": sum(1 for n in available if n["residential"] == "residential"), "datacenter_est": sum(1 for n in available if n["residential"] == "datacenter")}
+    stats = {"raw_nodes": raw_count, "sstp_nodes": sstp_count, "checked": len(results), "success": len(available), "failed": len(results) - len(available), "countries": len(countries), "residential_est": sum(1 for n in available if n["residential"] == "residential"), "datacenter_est": sum(1 for n in available if n["residential"] == "datacenter"), "quality_clean": sum(1 for n in available if (n.get("quality") or {}).get("rank") == 0), "quality_risky": sum(1 for n in available if (n.get("quality") or {}).get("rank") == 3), "quality_unknown": sum(1 for n in available if (n.get("quality") or {}).get("rank") == 4)}
     by_country = {}
     for name, grp in countries.items():
         grp["count"] = len(grp["nodes"])
         grp["residential"] = sum(1 for n in grp["nodes"] if n["residential"] == "residential")
         grp["datacenter"] = sum(1 for n in grp["nodes"] if n["residential"] == "datacenter")
-        grp["nodes"].sort(key=lambda n: (n.get("latency_ms") is None, n.get("latency_ms") or 0, n["host"]))
+        grp["nodes"].sort(key=node_sort_key)
         by_country[name] = grp
 
     data = {"generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"), "source": source, "worker": WORKER_CHECK_URL, "stats": stats, "countries": by_country, "available": available}
@@ -330,22 +439,28 @@ def build_nodes_text(data):
     edge = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS
     lines = []
     idx = 0
-    ordered = sorted(countries.items(), key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])))
-    for cname, grp in ordered:
+    flattened = []
+    for cname, grp in countries.items():
+        for node in grp["nodes"]:
+            flattened.append((cname, grp, node))
+    flattened.sort(key=lambda item: node_sort_key(item[2]))
+
+    counters = {}
+    for cname, grp, node in flattened:
         code = str(grp.get("code") or "?").upper()
         zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
-        label = f"{country_flag(code)} {zh}"
-        nodes = sorted(grp["nodes"], key=lambda n: (0 if n.get("residential") == "residential" else 1, n.get("latency_ms") is None, n.get("latency_ms") or 0, n.get("host") or ""))
-        res_nodes = [n for n in nodes if n.get("residential") == "residential"]
-        dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
-        for i, n in enumerate(res_nodes, 1):
-            entry = edge[idx % len(edge)]
-            idx += 1
-            lines.append(f"{entry}#{label}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
-        for i, n in enumerate(dc_nodes, 1):
-            entry = edge[idx % len(edge)]
-            idx += 1
-            lines.append(f"{entry}#{label}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+        exit_type = "住宅" if node.get("residential") == "residential" else "机房"
+        counter_key = (code, exit_type)
+        counters[counter_key] = counters.get(counter_key, 0) + 1
+        quality_label = (node.get("quality") or {}).get("label") or "⚪未知"
+        try:
+            latency_label = f"{max(0, int(node.get('latency_ms')))}ms"
+        except (TypeError, ValueError):
+            latency_label = "--ms"
+        label = f"{country_flag(code)} {zh}-{exit_type}-{quality_label}-{latency_label}-{counters[counter_key]:02d}"
+        entry = edge[idx % len(edge)]
+        idx += 1
+        lines.append(f"{entry}#{label}$sstp://vpn:vpn@{node['host']}:{node['port']}")
     return "\n".join(lines) + "\n"
 
 def write_outputs(data):
@@ -377,6 +492,8 @@ def write_outputs(data):
 def main():
     session = requests.Session()
     session.headers.update(worker_headers(CHECK_TOKEN))
+    quality_session = requests.Session()
+    quality_session.headers.update({"User-Agent": "gate-quality/1.0"})
     rows, source = fetch_vpngate()
     raw_count = len(rows)
     if raw_count == 0:
@@ -413,6 +530,12 @@ def main():
 
     if uniq and not success and len(worker_errors) == len(uniq):
         die("Worker 全部请求异常, 检测服务不可用 — 本次运行判定失败 (不生成空结果)")
+
+    log("IP QUALITY", f"评估 {len(success)} 个可用节点的出口信誉（并发 {QUALITY_CONCURRENCY}）")
+    quality_stats = enrich_quality(success, quality_session)
+    log("IP QUALITY", f"独立出口: {quality_stats['checked_ips']}")
+    log("IP QUALITY", f"较净出口: {quality_stats['clean']}")
+    log("IP QUALITY", f"未知出口: {quality_stats['unknown']}")
 
     data = build_outputs(results, raw_count, sstp_count, source)
     log("RESULT", f"可用节点: {len(success)}")
