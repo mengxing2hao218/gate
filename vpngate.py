@@ -314,6 +314,22 @@ def fetch_quality(ip, session):
         return unknown_quality(f"{type(exc).__name__}: {str(exc)[:160]}")
 
 
+def apply_exit_quality_hint(quality, exit_info):
+    result = dict(quality or unknown_quality("quality lookup unavailable"))
+    if not isinstance(exit_info, dict) or exit_info.get("is_datacenter") is not True:
+        return result
+    if int(result.get("rank", 4)) < 2:
+        result.update(
+            {
+                "label": "🟠一般",
+                "rank": 2,
+                "is_datacenter": True,
+                "source": "ipquery.io + exit metadata",
+            }
+        )
+    return result
+
+
 def enrich_quality(nodes, session):
     by_ip = {}
     for node in sorted(nodes, key=lambda n: (n.get("latency_ms") is None, n.get("latency_ms") or 0)):
@@ -328,7 +344,7 @@ def enrich_quality(nodes, session):
 
     for node in nodes:
         exit_ip = str((node.get("exit") or {}).get("ip") or "").strip()
-        node["quality"] = by_ip.get(exit_ip) or unknown_quality("quality lookup unavailable")
+        node["quality"] = apply_exit_quality_hint(by_ip.get(exit_ip), node.get("exit"))
 
     return {
         "checked_ips": len(by_ip),
