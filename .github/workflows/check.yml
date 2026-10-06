@@ -38,7 +38,11 @@ jobs:
           CHECK_CONCURRENCY: "32"
           CHECK_TIMEOUT: "45"
           MAX_CHECK_NODES: "500"
-          HOSTS_ENTRY: "edt.111065.xyz:443"
+          HOSTS_ENTRY: "saas.072159.xyz:443,hzytjy.cn:443,ali.nonull.pp.ua:443,auto.dolby.dpdns.org:443,cdn.cnno.de:443,saas.sin.fan:443,cf.777791.xyz:443,edt.111065.xyz:443"
+          PUBLISH_RESIDENTIAL_ONLY: "true"
+          PUBLISH_COUNTRIES: "JP,KR,HK,TW,SG"
+          PUBLISH_MAX_LATENCY_MS: "3500"
+          PUBLISH_MAX_NODES: "20"
           NODES_URL: "https://mengxing2hao218.github.io/gate/nodes.txt"
 
       - name: Consumer acceptance gate
