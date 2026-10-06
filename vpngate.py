@@ -54,6 +54,14 @@ QUALITY_MAX_IPS = max(1, min(100, int(os.environ.get("QUALITY_MAX_IPS", "100")))
 QUALITY_SPEED_BAND_MS = max(100, int(os.environ.get("QUALITY_SPEED_BAND_MS", "500")))
 MIN_PUBLISH_NODES = max(1, int(os.environ.get("MIN_PUBLISH_NODES", "5")))
 MAX_UNKNOWN_RATIO = min(1.0, max(0.0, float(os.environ.get("MAX_UNKNOWN_RATIO", "0.25"))))
+PUBLISH_RESIDENTIAL_ONLY = os.environ.get("PUBLISH_RESIDENTIAL_ONLY", "false").lower() == "true"
+PUBLISH_COUNTRIES = {
+    code.strip().upper()
+    for code in os.environ.get("PUBLISH_COUNTRIES", "").split(",")
+    if code.strip()
+}
+PUBLISH_MAX_LATENCY_MS = max(0, int(os.environ.get("PUBLISH_MAX_LATENCY_MS", "0")))
+PUBLISH_MAX_NODES = max(0, int(os.environ.get("PUBLISH_MAX_NODES", "0")))
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
 
@@ -450,6 +458,34 @@ def country_flag(code):
         return "🌐"
     return "".join(chr(127397 + ord(char)) for char in code)
 
+
+def select_publish_nodes(
+    candidates,
+    residential_only=PUBLISH_RESIDENTIAL_ONLY,
+    countries=PUBLISH_COUNTRIES,
+    max_latency_ms=PUBLISH_MAX_LATENCY_MS,
+    max_nodes=PUBLISH_MAX_NODES,
+):
+    allowed_countries = {str(code).strip().upper() for code in (countries or set()) if str(code).strip()}
+    selected = []
+    for cname, grp, node in sorted(candidates, key=lambda item: node_sort_key(item[2])):
+        code = str(grp.get("code") or "?").strip().upper()
+        if residential_only and node.get("residential") != "residential":
+            continue
+        if allowed_countries and code not in allowed_countries:
+            continue
+        try:
+            latency = max(0, int(node.get("latency_ms")))
+        except (TypeError, ValueError):
+            continue
+        if max_latency_ms and latency > int(max_latency_ms):
+            continue
+        selected.append((cname, grp, node))
+        if max_nodes and len(selected) >= int(max_nodes):
+            break
+    return selected
+
+
 def build_nodes_text(data):
     """生成纯节点行版本 (无注释): 每行 = 入口地址#名字$sstp://..."""
     countries = data["countries"]
@@ -461,7 +497,7 @@ def build_nodes_text(data):
     for cname, grp in countries.items():
         for node in grp["nodes"]:
             flattened.append((cname, grp, node))
-    flattened.sort(key=lambda item: node_sort_key(item[2]))
+    flattened = select_publish_nodes(flattened)
 
     counters = {}
     for cname, grp, node in flattened:
